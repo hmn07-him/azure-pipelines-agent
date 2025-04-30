@@ -15,11 +15,7 @@ namespace Agent.Sdk.SecretMasking;
 public sealed class OssSecretMasker : ISecretMasker, IDisposable
 {
     private SecretMasker _secretMasker;
-    private ConcurrentDictionary<string, string> _detectionTelemetry;
-    private Action<Detection> _detectionAction;
-    private long _charsScanned;
-    private long _stringsScanned;
-    private long _totalDetections;
+    private Telemetry _telemetry;
 
     /// <summary>
     /// The maximum number properties to report in a single
@@ -55,15 +51,7 @@ public sealed class OssSecretMasker : ISecretMasker, IDisposable
     private OssSecretMasker(OssSecretMasker copy)
     {
         _secretMasker = copy._secretMasker.Clone();
-
-        if (copy.TelemetryEnabled)
-        {
-            _charsScanned = copy._charsScanned;
-            _stringsScanned = copy._stringsScanned;
-            _totalDetections = copy._totalDetections;
-            _detectionTelemetry = new ConcurrentDictionary<string, string>(copy._detectionTelemetry);
-            _detectionAction = this.ProcessDetectionForTelemetry;
-        }
+        _telemetry = copy._telemetry?.Clone();
     }
 
     /// <summary>
@@ -118,37 +106,18 @@ public sealed class OssSecretMasker : ISecretMasker, IDisposable
     {
         _secretMasker?.Dispose();
         _secretMasker = null;
+        _telemetry = null;
     }
 
     public string MaskSecrets(string input)
     {
-        if (TelemetryEnabled)
-        {
-            Interlocked.Add(ref _charsScanned, input.Length);
-            Interlocked.Increment(ref _stringsScanned);
-        }
-
-        return _secretMasker.MaskSecrets(input, _detectionAction);
+        _telemetry?.ProcessInput(input);
+        return _secretMasker.MaskSecrets(input, _telemetry?.DetectionAction);
     }
 
-    public bool TelemetryEnabled
+    public void EnableTelemetry()
     {
-        get => _detectionAction != null;
-        set
-        {
-            if (value != TelemetryEnabled)
-            {
-                if (value)
-                {
-                    _detectionTelemetry = new ConcurrentDictionary<string, string>();
-                    _detectionAction = this.ProcessDetectionForTelemetry;
-                }
-                else
-                {
-                    throw new InvalidOperationException("SecretMasker telemetry cannot be turned off if it has been turned on before.");
-                }
-            }
-        }
+        _telemetry ??= new Telemetry();
     }
 
     /// <summary>
@@ -163,7 +132,7 @@ public sealed class OssSecretMasker : ISecretMasker, IDisposable
     /// </summary>
     public void PublishTelemetry(PublishSecretMaskerTelemetryAction publishAction)
     {
-        if (!TelemetryEnabled)
+        if (_telemetry == null)
         {
             return;
         }
@@ -171,18 +140,18 @@ public sealed class OssSecretMasker : ISecretMasker, IDisposable
         Dictionary<string, string> detectionData = null;
         int events = 0;
 
-        foreach (var pair in _detectionTelemetry)
+        foreach (var pair in _telemetry.Detections)
         {
             detectionData ??= new Dictionary<string, string>(MaxDetectionsPerTelemetryEvent);
             detectionData.Add(pair.Key, pair.Value);
 
-            if (detectionData.Count == MaxDetectionsPerTelemetryEvent)
+            if (detectionData.Count >= MaxDetectionsPerTelemetryEvent)
             {
                 publishAction("SecretMaskerDetections", detectionData);
                 events++;
                 detectionData = null;
 
-                if (events == MaxTelemetryDetectionEvents)
+                if (events >= MaxTelemetryDetectionEvents)
                 {
                     break;
                 }
@@ -196,7 +165,7 @@ public sealed class OssSecretMasker : ISecretMasker, IDisposable
         }
 
         var overallData = new Dictionary<string, string>(GetOverallTelemetry());
-        if (_detectionTelemetry.Count > MaxTelemetryDetections)
+        if (_telemetry.Detections.Count > MaxTelemetryDetections)
         {
             overallData.Add("DetectionDataIsIncomplete", "true");
         }
@@ -204,27 +173,65 @@ public sealed class OssSecretMasker : ISecretMasker, IDisposable
         publishAction("SecretMasker", overallData);
     }
 
-    private void ProcessDetectionForTelemetry(Detection detection)
-    {
-        Interlocked.Increment(ref _totalDetections);
-
-        if (detection.CrossCompanyCorrelatingId != null)
-        {
-            _detectionTelemetry.TryAdd(detection.CrossCompanyCorrelatingId, detection.Moniker);
-        }
-    }
-
     private KeyValuePair<string, string>[] GetOverallTelemetry()
     {
         double elapsedMaskingTimeInMilliseconds = (double)_secretMasker.ElapsedMaskingTime / TimeSpan.TicksPerMillisecond;
         return new KeyValuePair<string, string>[] {
             new("Version", SecretMasker.Version.ToString()),
-            new("CharsScanned", _charsScanned.ToString(CultureInfo.InvariantCulture)),
-            new("StringsScanned", _stringsScanned.ToString(CultureInfo.InvariantCulture)),
-            new("TotalDetections", _totalDetections.ToString(CultureInfo.InvariantCulture)),
-            new("UniqueCorrelatingIds", _detectionTelemetry.Count.ToString(CultureInfo.InvariantCulture)),
+            new("CharsScanned", _telemetry.CharsScanned.ToString(CultureInfo.InvariantCulture)),
+            new("StringsScanned", _telemetry.StringsScanned.ToString(CultureInfo.InvariantCulture)),
+            new("TotalDetections", _telemetry.TotalDetections.ToString(CultureInfo.InvariantCulture)),
+            new("UniqueCorrelatingIds", _telemetry.Detections.Count.ToString(CultureInfo.InvariantCulture)),
             new("ElapsedMaskingTimeInMilliseconds", elapsedMaskingTimeInMilliseconds.ToString(CultureInfo.InvariantCulture)),
         };
+    }
+
+    private sealed class Telemetry
+    {
+        private readonly ConcurrentDictionary<string, string> _detections;
+        private long _charsScanned;
+        private long _stringsScanned;
+        private long _totalDetections;
+
+        public IReadOnlyDictionary<string, string> Detections => _detections;
+        public long CharsScanned => _charsScanned;
+        public long StringsScanned => _stringsScanned;
+        public long TotalDetections => _totalDetections;
+        public readonly Action<Detection> DetectionAction;
+
+        public Telemetry()
+        {
+            _detections = new ConcurrentDictionary<string, string>();
+            DetectionAction = ProcessDetection;
+        }
+
+        private Telemetry(Telemetry copy)
+        {
+            _detections = new ConcurrentDictionary<string, string>(copy.Detections);
+            DetectionAction = ProcessDetection;
+
+            _charsScanned = copy.CharsScanned;
+            _stringsScanned = copy.StringsScanned;
+            _totalDetections = copy.TotalDetections;
+        }
+
+        public Telemetry Clone() => new(this);
+
+        public void ProcessInput(string input)
+        {
+            Interlocked.Add(ref _charsScanned, input.Length);
+            Interlocked.Increment(ref _stringsScanned);
+        }
+
+        private void ProcessDetection(Detection detection)
+        {
+            Interlocked.Increment(ref _totalDetections);
+
+            if (detection.CrossCompanyCorrelatingId != null)
+            {
+                _detections.TryAdd(detection.CrossCompanyCorrelatingId, detection.Moniker);
+            }
+        }
     }
 
     /// <summary>

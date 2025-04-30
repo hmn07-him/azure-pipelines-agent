@@ -28,20 +28,6 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests
             return new OssSecretMasker();
         }
 
-        [Fact]
-        [Trait("Level", "L0")]
-        [Trait("Category", "SecretMasker")]
-        public void OssLoggedSecretMasker_TelemetryEnabled_ThrowsOnAttemptToDisable()
-        {
-            using var lsm = new LoggedSecretMasker(CreateSecretMasker());
-            Assert.False(lsm.TelemetryEnabled);
-
-            lsm.TelemetryEnabled = true;
-            Assert.True(lsm.TelemetryEnabled);
-
-            Assert.Throws<InvalidOperationException>(() => lsm.TelemetryEnabled = false);
-        }
-
         [Theory]
         [Trait("Level", "L0")]
         [Trait("Category", "SecretMasker")]
@@ -63,7 +49,8 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests
                                            pattern: "TEST[0-9]+");
 
             using var ossMasker = new OssSecretMasker(new[] { pattern });
-            using var lsm = new LoggedSecretMasker(ossMasker) { TelemetryEnabled = true };
+            using var lsm = new LoggedSecretMasker(ossMasker);
+            lsm.EnableTelemetry();
 
             int charsScanned = 0;
             int stringsScanned = 0;
@@ -179,8 +166,8 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests
         public void VsoLoggedSecretMasker_TelemetryEnabled_Ignored()
         {
             using var lsm = new LoggedSecretMasker(CreateSecretMasker());
-            lsm.TelemetryEnabled = true;
-            Assert.False(lsm.TelemetryEnabled, "Setting TelemetryEnabled to true should be ignored since since VSO masker does not support telemetry.");
+            lsm.EnableTelemetry(); // no-op
+            lsm.PublishTelemetry((_, _) => Assert.True(false, "This should not be called."));
         }
     }
 
@@ -194,7 +181,6 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests
         public void LoggedSecretMasker_TelemetryDisabled_DoesNotPublish()
         {
             using var lsm = new LoggedSecretMasker(CreateSecretMasker());
-            Assert.False(lsm.TelemetryEnabled);
             lsm.PublishTelemetry((_, _) => Assert.True(false, "This should not be called."));
         }
 

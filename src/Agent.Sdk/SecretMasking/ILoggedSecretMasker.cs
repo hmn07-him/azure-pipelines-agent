@@ -26,7 +26,7 @@ namespace Agent.Sdk.SecretMasking
         void AddValueEncoder(ValueEncoder encoder, string origin);
         void SetTrace(ITraceWriter trace);
 
-        bool TelemetryEnabled { get; set; }
+        void EnableTelemetry();
         void PublishTelemetry(PublishSecretMaskerTelemetryAction publishAction);
     }
 }

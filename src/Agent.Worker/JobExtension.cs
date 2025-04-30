@@ -78,7 +78,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
 
                     if (AgentKnobs.SendSecretMaskerTelemetry.GetValue(context).AsBoolean())
                     {
-                        jobContext.GetHostContext().SecretMasker.TelemetryEnabled = true;
+                        jobContext.GetHostContext().SecretMasker.EnableTelemetry();
                     }
 
                     PackageVersion agentVersion = new PackageVersion(BuildConstants.AgentPackage.Version);
