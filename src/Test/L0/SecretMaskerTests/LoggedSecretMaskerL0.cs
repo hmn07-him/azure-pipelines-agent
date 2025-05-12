@@ -1,16 +1,15 @@
 ﻿// Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-using Agent.Sdk.SecretMasking;
-using Microsoft.Security.Utilities;
 using System;
 using System.Collections.Generic;
 using System.Globalization;
-using System.Linq;
+
+using Agent.Sdk.SecretMasking;
+using Microsoft.Security.Utilities;
 using Xunit;
 using Xunit.Abstractions;
-using ISecretMasker = Microsoft.TeamFoundation.DistributedTask.Logging.ISecretMasker;
-using VsoSecretMasker = Microsoft.TeamFoundation.DistributedTask.Logging.SecretMasker;
+
 
 namespace Microsoft.VisualStudio.Services.Agent.Tests
 {
@@ -23,10 +22,14 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests
             _output = output;
         }
 
-        protected override ISecretMasker CreateSecretMasker()
+        protected override IRawSecretMasker CreateSecretMasker()
         {
             return new OssSecretMasker();
         }
+
+        private const int _maxTelemetryDetections = 100;
+        private const int _maxDetectionsPerTelemetryEvent = 20;
+        private const int _maxDetectionEvents = 5;
 
         [Theory]
         [Trait("Level", "L0")]
@@ -34,12 +37,12 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests
         [InlineData(0)]
         [InlineData(1)]
         [InlineData(2)]
-        [InlineData(OssSecretMasker.MaxTelemetryDetections - 1)]
-        [InlineData(OssSecretMasker.MaxTelemetryDetections)]
-        [InlineData(OssSecretMasker.MaxTelemetryDetections + 1)]
-        [InlineData(2 * OssSecretMasker.MaxTelemetryDetections - 1)]
-        [InlineData(2 * OssSecretMasker.MaxTelemetryDetections)]
-        [InlineData(2 * OssSecretMasker.MaxTelemetryDetections + 1)]
+        [InlineData(_maxTelemetryDetections - 1)]
+        [InlineData(_maxTelemetryDetections)]
+        [InlineData(_maxTelemetryDetections + 1)]
+        [InlineData(2 * _maxTelemetryDetections - 1)]
+        [InlineData(2 * _maxTelemetryDetections)]
+        [InlineData(2 * _maxTelemetryDetections + 1)]
         public void OssLoggedSecretMasker_TelemetryEnabled_SendsTelemetry(int uniqueCorrelatingIds)
         {
             var pattern = new RegexPattern(id: "TEST001/001",
@@ -50,7 +53,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests
 
             using var ossMasker = new OssSecretMasker(new[] { pattern });
             using var lsm = new LoggedSecretMasker(ossMasker);
-            lsm.EnableTelemetry();
+            lsm.StartTelemetry(_maxTelemetryDetections);
 
             int charsScanned = 0;
             int stringsScanned = 0;
@@ -75,7 +78,9 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests
             var correlatingIdsToObserve = new HashSet<string>(correlatingIds);
 
             var telemetry = new List<(string Feature, Dictionary<string, string> Data)>();
-            lsm.PublishTelemetry((feature, data) =>
+            lsm.StopAndPublishTelemetry(
+                _maxDetectionsPerTelemetryEvent,
+                (feature, data) =>
             {
                 _output.WriteLine($"Telemetry Event Received: {feature}");
                 _output.WriteLine($"Properties: ({data.Count}):");
@@ -90,13 +95,13 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests
                 telemetry.Add((feature, data));
             });
 
-            int remainder = uniqueCorrelatingIds % OssSecretMasker.MaxDetectionsPerTelemetryEvent;
-            int expectedDetectionEvents = (uniqueCorrelatingIds / OssSecretMasker.MaxDetectionsPerTelemetryEvent) + (remainder == 0 ? 0 : 1);
+            int remainder = uniqueCorrelatingIds % _maxDetectionsPerTelemetryEvent;
+            int expectedDetectionEvents = (uniqueCorrelatingIds / _maxDetectionsPerTelemetryEvent) + (remainder == 0 ? 0 : 1);
 
-            bool maxEventsExceeded = expectedDetectionEvents > OssSecretMasker.MaxTelemetryDetectionEvents;
+            bool maxEventsExceeded = expectedDetectionEvents > _maxDetectionEvents;
             if (maxEventsExceeded)
             {
-                expectedDetectionEvents = OssSecretMasker.MaxTelemetryDetectionEvents;
+                expectedDetectionEvents = _maxDetectionEvents;
             }
 
             int expectedEvents = expectedDetectionEvents + 1;
@@ -114,7 +119,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests
 
                 if (maxEventsExceeded || remainder == 0 || i < expectedDetectionEvents - 1)
                 {
-                    Assert.Equal(OssSecretMasker.MaxDetectionsPerTelemetryEvent, detectionData.Count);
+                    Assert.Equal(_maxDetectionsPerTelemetryEvent, detectionData.Count);
                 }
                 else
                 {
@@ -130,7 +135,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests
 
             if (maxEventsExceeded)
             {
-                Assert.Equal(uniqueCorrelatingIds - OssSecretMasker.MaxTelemetryDetections, correlatingIdsToObserve.Count);
+                Assert.Equal(uniqueCorrelatingIds - _maxTelemetryDetections, correlatingIdsToObserve.Count);
             }
             else
             {
@@ -143,21 +148,16 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests
             Assert.Equal(SecretMasker.Version.ToString(), overallData["Version"]);
             Assert.Equal(charsScanned.ToString(CultureInfo.InvariantCulture), overallData["CharsScanned"]);
             Assert.Equal(stringsScanned.ToString(CultureInfo.InvariantCulture), overallData["StringsScanned"]);
-            Assert.Equal(uniqueCorrelatingIds.ToString(CultureInfo.InvariantCulture), overallData["UniqueCorrelatingIds"]);
             Assert.True(0.0 <= double.Parse(overallData["ElapsedMaskingTimeInMilliseconds"], CultureInfo.InvariantCulture));
-
-            if (maxEventsExceeded)
-            {
-                Assert.Equal("true", overallData["DetectionDataIsIncomplete"]);
-            }
+            Assert.Equal(maxEventsExceeded.ToString(CultureInfo.InvariantCulture), overallData["DetectionDataIsIncomplete"]);
         }
     }
 
-    public class VsoLoggedSecretMaskerL0 : LoggedSecretMaskerL0
+    public class LegacyLoggedSecretMaskerL0 : LoggedSecretMaskerL0
     {
-        protected override ISecretMasker CreateSecretMasker()
+        protected override IRawSecretMasker CreateSecretMasker()
         {
-            return new VsoSecretMasker();
+            return new LegacySecretMasker();
         }
 
         [Fact]
@@ -166,14 +166,14 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests
         public void VsoLoggedSecretMasker_TelemetryEnabled_Ignored()
         {
             using var lsm = new LoggedSecretMasker(CreateSecretMasker());
-            lsm.EnableTelemetry(); // no-op
-            lsm.PublishTelemetry((_, _) => Assert.True(false, "This should not be called."));
+            lsm.StartTelemetry(maxDetections: 1); // no-op: legacy VSO masker does not support telemetry. 
+            lsm.StopAndPublishTelemetry(maxDetectionsPerEvent: 1, (_, _) => Assert.True(false, "This should not be called."));
         }
     }
 
     public abstract class LoggedSecretMaskerL0
     {
-        protected abstract ISecretMasker CreateSecretMasker();
+        protected abstract IRawSecretMasker CreateSecretMasker();
 
         [Fact]
         [Trait("Level", "L0")]
@@ -181,7 +181,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests
         public void LoggedSecretMasker_TelemetryDisabled_DoesNotPublish()
         {
             using var lsm = new LoggedSecretMasker(CreateSecretMasker());
-            lsm.PublishTelemetry((_, _) => Assert.True(false, "This should not be called."));
+            lsm.StopAndPublishTelemetry(maxDetectionsPerEvent: 1, (_, _) => Assert.True(false, "This should not be called."));
         }
 
         [Fact]

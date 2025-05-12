@@ -1,57 +1,30 @@
 ﻿// Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
-using Microsoft.Security.Utilities;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Text.RegularExpressions;
 using System.Threading;
-using ISecretMasker = Microsoft.TeamFoundation.DistributedTask.Logging.ISecretMasker;
-using ValueEncoder = Microsoft.TeamFoundation.DistributedTask.Logging.ValueEncoder;
+
+using Microsoft.Security.Utilities;
 
 namespace Agent.Sdk.SecretMasking;
 
-public sealed class OssSecretMasker : ISecretMasker, IDisposable
+/// <summary>
+/// New secret masker that dispatches to <see cref="SecretMasker"/> from
+/// 'Microsoft.Security.Utilities'.
+/// </summary>
+public sealed class OssSecretMasker : IRawSecretMasker, IDisposable
 {
     private SecretMasker _secretMasker;
     private Telemetry _telemetry;
 
-    /// <summary>
-    /// The maximum number properties to report in a single
-    /// 'SecretMaskerDetections' telemetry event. This value was chosen to keep
-    /// the size in the range of existing routine telemetry events.
-    /// </summary>
-    public const int MaxDetectionsPerTelemetryEvent = 20;
-
-    /// <summary>
-    /// The maximum number of 'SecreMaskerDetections' telemetry events to send.
-    /// If this would be have to be exceeded to record all unique C3Id, the
-    /// overall 'SecretMasker' event will indicate this by including a
-    /// 'DetectionDataIsIncomplete' property set to 'true'.
-    /// </summary>
-    public const int MaxTelemetryDetectionEvents = 5;
-
-    /// <summary>
-    /// The maximum number of key=C3ID, value=Moniker properties that can be
-    /// sent across all events.
-    /// </summary>
-    public const int MaxTelemetryDetections = MaxDetectionsPerTelemetryEvent * MaxTelemetryDetectionEvents;
-
-    public OssSecretMasker() : this(Array.Empty<RegexPattern>())
+    public OssSecretMasker(IEnumerable<RegexPattern> patterns = null)
     {
-    }
-
-    public OssSecretMasker(IEnumerable<RegexPattern> patterns)
-    {
-        _secretMasker = new SecretMasker(patterns, generateCorrelatingIds: true);
-        _secretMasker.DefaultRegexRedactionToken = "***";
-    }
-
-    private OssSecretMasker(OssSecretMasker copy)
-    {
-        _secretMasker = copy._secretMasker.Clone();
-        _telemetry = copy._telemetry?.Clone();
+        _secretMasker = new SecretMasker(patterns,
+                                         generateCorrelatingIds: true,
+                                         defaultRegexRedactionToken: "***");
     }
 
     /// <summary>
@@ -63,9 +36,6 @@ public sealed class OssSecretMasker : ISecretMasker, IDisposable
         set => _secretMasker.MinimumSecretLength = value;
     }
 
-    /// <summary>
-    /// This implementation assumes no more than one thread is adding regexes, values, or encoders at any given time.
-    /// </summary>
     public void AddRegex(string pattern)
     {
         // NOTE: This code path is used for regexes sent to the agent via
@@ -84,23 +54,15 @@ public sealed class OssSecretMasker : ISecretMasker, IDisposable
         _secretMasker.AddRegex(regexPattern);
     }
 
-    /// <summary>
-    /// This implementation assumes no more than one thread is adding regexes, values, or encoders at any given time.
-    /// </summary>
     public void AddValue(string test)
     {
         _secretMasker.AddValue(test);
     }
 
-    /// <summary>
-    /// This implementation assumes no more than one thread is adding regexes, values, or encoders at any given time.
-    /// </summary>
-    public void AddValueEncoder(ValueEncoder encoder)
+    public void AddValueEncoder(Func<string, string> encoder)
     {
-       _secretMasker.AddLiteralEncoder(x => encoder(x));
+        _secretMasker.AddLiteralEncoder(x => encoder(x));
     }
-
-    public OssSecretMasker Clone() => new OssSecretMasker(this);
 
     public void Dispose()
     {
@@ -111,111 +73,67 @@ public sealed class OssSecretMasker : ISecretMasker, IDisposable
 
     public string MaskSecrets(string input)
     {
-        _telemetry?.ProcessInput(input);
-        return _secretMasker.MaskSecrets(input, _telemetry?.DetectionAction);
+        _secretMasker.SyncObject.EnterReadLock();
+        try
+        {
+            _telemetry?.ProcessInput(input);
+            return _secretMasker.MaskSecrets(input, _telemetry?.ProcessDetection);
+        }
+        finally
+        {
+            _secretMasker.SyncObject.ExitReadLock();
+        }
     }
 
-    public void EnableTelemetry()
+    public void StartTelemetry(int maxDetections)
     {
-        _telemetry ??= new Telemetry();
+        _secretMasker.SyncObject.EnterWriteLock();
+        try
+        {
+            _telemetry ??= new Telemetry(maxDetections);
+        }
+        finally
+        {
+          _secretMasker.SyncObject.ExitWriteLock();
+        }
     }
 
-    /// <summary>
-    /// If enabled via <see cref="TelemetryEnabled"/> opt-in, publishes
-    /// telemetry via the provided callback that handles sending it over the
-    /// wire.
-    ///
-    /// Always publishes a 'SecretMasker' event with overall stats, and may
-    /// publish 'SecretMaskerDetections' events mapping C3ID (12 byte
-    /// non-reversible seeded hash) to pattern moniker ('name'.'id') for
-    /// rule-based patterns with high entropy if any such detections are found.
-    /// </summary>
-    public void PublishTelemetry(PublishSecretMaskerTelemetryAction publishAction)
+    public void StopAndPublishTelemetry(PublishSecretMaskerTelemetryAction publishAction, int maxDetectionsPerEvent)
     {
-        if (_telemetry == null)
+        Telemetry telemetry;
+
+        _secretMasker.SyncObject.EnterWriteLock();
+        try
         {
-            return;
+            telemetry = _telemetry;
+            _telemetry = null;
+        }
+        finally
+        {
+            _secretMasker.SyncObject.ExitWriteLock();
         }
 
-        Dictionary<string, string> detectionData = null;
-        int events = 0;
-
-        foreach (var pair in _telemetry.Detections)
-        {
-            detectionData ??= new Dictionary<string, string>(MaxDetectionsPerTelemetryEvent);
-            detectionData.Add(pair.Key, pair.Value);
-
-            if (detectionData.Count >= MaxDetectionsPerTelemetryEvent)
-            {
-                publishAction("SecretMaskerDetections", detectionData);
-                events++;
-                detectionData = null;
-
-                if (events >= MaxTelemetryDetectionEvents)
-                {
-                    break;
-                }
-            }
-        }
-
-        if (events < MaxTelemetryDetectionEvents && detectionData != null)
-        {
-            publishAction("SecretMaskerDetections", detectionData);
-            detectionData = null;
-        }
-
-        var overallData = new Dictionary<string, string>(GetOverallTelemetry());
-        if (_telemetry.Detections.Count > MaxTelemetryDetections)
-        {
-            overallData.Add("DetectionDataIsIncomplete", "true");
-        }
-
-        publishAction("SecretMasker", overallData);
-    }
-
-    private KeyValuePair<string, string>[] GetOverallTelemetry()
-    {
-        double elapsedMaskingTimeInMilliseconds = (double)_secretMasker.ElapsedMaskingTime / TimeSpan.TicksPerMillisecond;
-        return new KeyValuePair<string, string>[] {
-            new("Version", SecretMasker.Version.ToString()),
-            new("CharsScanned", _telemetry.CharsScanned.ToString(CultureInfo.InvariantCulture)),
-            new("StringsScanned", _telemetry.StringsScanned.ToString(CultureInfo.InvariantCulture)),
-            new("TotalDetections", _telemetry.TotalDetections.ToString(CultureInfo.InvariantCulture)),
-            new("UniqueCorrelatingIds", _telemetry.Detections.Count.ToString(CultureInfo.InvariantCulture)),
-            new("ElapsedMaskingTimeInMilliseconds", elapsedMaskingTimeInMilliseconds.ToString(CultureInfo.InvariantCulture)),
-        };
+        telemetry?.Publish(publishAction, _secretMasker.ElapsedMaskingTime, maxDetectionsPerEvent);
     }
 
     private sealed class Telemetry
     {
-        private readonly ConcurrentDictionary<string, string> _detections;
+        // NOTE: Telemetry does not fit into the reader-writer lock model of the
+        // SecretMasker API because we *write* telemetry during *read*
+        // operations. We therefore use separate interlocked operations and a
+        // concurrent dictionary when writing to telemetry.
+        private readonly ConcurrentDictionary<string, string> _detectionData;
+        private readonly int _maxDetections;
         private long _charsScanned;
         private long _stringsScanned;
         private long _totalDetections;
 
-        public IReadOnlyDictionary<string, string> Detections => _detections;
-        public long CharsScanned => _charsScanned;
-        public long StringsScanned => _stringsScanned;
-        public long TotalDetections => _totalDetections;
-        public readonly Action<Detection> DetectionAction;
-
-        public Telemetry()
+        public Telemetry(int maxDetections)
         {
-            _detections = new ConcurrentDictionary<string, string>();
-            DetectionAction = ProcessDetection;
+            _detectionData = new();
+            _maxDetections = maxDetections;
+            ProcessDetection = ProcessDetectionImplementation;
         }
-
-        private Telemetry(Telemetry copy)
-        {
-            _detections = new ConcurrentDictionary<string, string>(copy.Detections);
-            DetectionAction = ProcessDetection;
-
-            _charsScanned = copy.CharsScanned;
-            _stringsScanned = copy.StringsScanned;
-            _totalDetections = copy.TotalDetections;
-        }
-
-        public Telemetry Clone() => new(this);
 
         public void ProcessInput(string input)
         {
@@ -223,81 +141,71 @@ public sealed class OssSecretMasker : ISecretMasker, IDisposable
             Interlocked.Increment(ref _stringsScanned);
         }
 
-        private void ProcessDetection(Detection detection)
+        public Action<Detection> ProcessDetection { get; }
+
+        private void ProcessDetectionImplementation(Detection detection)
         {
             Interlocked.Increment(ref _totalDetections);
 
-            if (detection.CrossCompanyCorrelatingId != null)
+            // NOTE: We cannot prevent the concurrent dictionary from exceeding
+            // the maximum detection count when multiple threads add detections
+            // in parallel. The condition here is therefore a best effort to
+            // constrain the memory consumed by excess detections that will not
+            // be published. Furthermore, it is deliberate that we use <=
+            // instead of < here as it allows us to detect the case where the
+            // maximum number of events have been exceeded without adding any
+            // additional state.
+            if (_detectionData.Count <= _maxDetections && detection.CrossCompanyCorrelatingId != null)
             {
-                _detections.TryAdd(detection.CrossCompanyCorrelatingId, detection.Moniker);
+                _detectionData.TryAdd(detection.CrossCompanyCorrelatingId, detection.Moniker);
             }
         }
-    }
 
-    /// <summary>
-    /// Removes secrets from the dictionary shorter than the MinSecretLength property.
-    /// This implementation assumes no more than one thread is adding regexes, values, or encoders at any given time.
-    /// </summary>
-    public void RemoveShortSecretsFromDictionary()
-    {
-        var filteredValueSecrets = new HashSet<SecretLiteral>();
-        var filteredRegexSecrets = new HashSet<RegexPattern>();
-
-        try
+        public void Publish(PublishSecretMaskerTelemetryAction publishAction, TimeSpan elapsedMaskingTime, int maxDetectionsPerEvent)
         {
-            _secretMasker.SyncObject.EnterReadLock();
+            Dictionary<string, string> detectionData = null;
+            int detectionsProcessed = 0;
+            bool detectionDataIsIncomplete = false;
 
-            foreach (var secret in _secretMasker.EncodedSecretLiterals)
+            foreach (var pair in _detectionData)
             {
-                if (secret.Value.Length < MinSecretLength)
+                if (detectionsProcessed >= _maxDetections)
                 {
-                    filteredValueSecrets.Add(secret);
+                    detectionDataIsIncomplete = true;
+                    break;
+                }
+
+                detectionData ??= new Dictionary<string, string>(maxDetectionsPerEvent);
+                detectionData.Add(pair.Key, pair.Value);
+                detectionsProcessed++;
+
+                if (detectionData.Count >= maxDetectionsPerEvent)
+                {
+                    publishAction("SecretMaskerDetections", detectionData);
+                    detectionData = null;
                 }
             }
 
-            foreach (var secret in _secretMasker.RegexPatterns)
+            if (detectionData != null)
             {
-                if (secret.Pattern.Length < MinSecretLength)
-                {
-                    filteredRegexSecrets.Add(secret);
-                }
-            }
-        }
-        finally
-        {
-            if (_secretMasker.SyncObject.IsReadLockHeld)
-            {
-                _secretMasker.SyncObject.ExitReadLock();
-            }
-        }
-
-        try
-        {
-            _secretMasker.SyncObject.EnterWriteLock();
-
-            foreach (var secret in filteredValueSecrets)
-            {
-                _secretMasker.EncodedSecretLiterals.Remove(secret);
+                publishAction("SecretMaskerDetections", detectionData);
+                detectionData = null;
             }
 
-            foreach (var secret in filteredRegexSecrets)
-            {
-                _secretMasker.RegexPatterns.Remove(secret);
-            }
+            var overallData = new Dictionary<string, string> {
+                { "Version", SecretMasker.Version.ToString() },
+                { "CharsScanned", _charsScanned.ToString(CultureInfo.InvariantCulture) },
+                { "StringsScanned", _stringsScanned.ToString(CultureInfo.InvariantCulture) },
+                { "TotalDetections", _totalDetections.ToString(CultureInfo.InvariantCulture) },
+                { "ElapsedMaskingTimeInMilliseconds", elapsedMaskingTime.TotalMilliseconds.ToString(CultureInfo.InvariantCulture) },
+                { "DetectionDataIsIncomplete", detectionDataIsIncomplete.ToString(CultureInfo.InvariantCulture) },
+            };
 
-            foreach (var secret in filteredValueSecrets)
-            {
-                _secretMasker.ExplicitlyAddedSecretLiterals.Remove(secret);
-            }
-        }
-        finally
-        {
-            if (_secretMasker.SyncObject.IsWriteLockHeld)
-            {
-                _secretMasker.SyncObject.ExitWriteLock();
-            }
+            publishAction("SecretMasker", overallData);
         }
     }
 
-    ISecretMasker ISecretMasker.Clone() => this.Clone();
+    // This is a no-op for the OSS SecretMasker because it respects
+    // MinimumSecretLength immediately without requiring an extra API call.
+    void IRawSecretMasker.RemoveShortSecretsFromDictionary() { }
 }

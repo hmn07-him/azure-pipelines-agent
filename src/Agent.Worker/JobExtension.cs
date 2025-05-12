@@ -78,7 +78,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
 
                     if (AgentKnobs.SendSecretMaskerTelemetry.GetValue(context).AsBoolean())
                     {
-                        jobContext.GetHostContext().SecretMasker.EnableTelemetry();
+                        jobContext.GetHostContext().SecretMasker.StartTelemetry(maxDetections: 100);
                     }
 
                     PackageVersion agentVersion = new PackageVersion(BuildConstants.AgentPackage.Version);
@@ -768,7 +768,9 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
             if (AgentKnobs.SendSecretMaskerTelemetry.GetValue(jobContext).AsBoolean())
             {
                 ILoggedSecretMasker masker = jobContext.GetHostContext().SecretMasker;
-                masker.PublishTelemetry((feature, data) => PublishTelemetry(jobContext, data, feature));
+                masker.StopAndPublishTelemetry(
+                    maxDetectionsPerEvent: 20,
+                    (feature, data) => PublishTelemetry(jobContext, data, feature));
             }
         }
 
