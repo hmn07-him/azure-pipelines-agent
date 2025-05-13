@@ -17,6 +17,7 @@ using Agent.Sdk.Knob;
 using Agent.Sdk.SecretMasking;
 using Newtonsoft.Json;
 using Microsoft.VisualStudio.Services.Agent.Worker.Telemetry;
+using Microsoft.Identity.Client.TelemetryCore.TelemetryClient;
 
 namespace Microsoft.VisualStudio.Services.Agent.Worker
 {
@@ -233,6 +234,32 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
                         {
                             // Log the error
                             Trace.Info($"Caught exception from async command WindowsPreinstalledGitTelemetry: {ex}");
+                        }
+                    }
+
+                    // Check if the Agent CDN is accessible
+                    if (AgentKnobs.AgentCDNConnectivityFailWarning.GetValue(context).AsBoolean())
+                    {
+                        try
+                        {
+                            Trace.Verbose("Checking if the Agent CDN Endpoint (download.agent.dev.azure.com) is reachable");
+                            bool isAgentCDNAccessible = await PlatformUtil.IsAgentCdnAccessibleAsync(agentWebProxy.WebProxy);
+                            if (isAgentCDNAccessible)
+                            {
+                                context.Output("Agent CDN is accessible.");
+                            }
+                            else
+                            {
+                                context.Warning(StringUtil.Loc("AgentCdnAccessFailWarning"));
+                            }
+                            PublishAgentCDNAccessStatusTelemetry(context, isAgentCDNAccessible);
+                        }
+                        catch (Exception ex)
+                        {
+                            // Handles network-level or unexpected exceptions (DNS failure, timeout, etc.)
+                            context.Warning(StringUtil.Loc("AgentCdnAccessFailWarning"));
+                            PublishAgentCDNAccessStatusTelemetry(context, false);
+                            Trace.Error($"Exception when attempting a HEAD request to Agent CDN: {ex}");
                         }
                     }
 
@@ -763,6 +790,31 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
             PublishTelemetry(jobContext, telemetryData, "KnobsStatus");
         }
 
+        private void PublishAgentCDNAccessStatusTelemetry(IExecutionContext context, bool isAgentCDNAccessible)
+        {
+            try
+            {
+                var telemetryData = new Dictionary<string, string>
+                {
+                    ["JobId"] = context?.Variables?.System_JobId?.ToString() ?? string.Empty,
+                    ["isAgentCDNAccessible"] = isAgentCDNAccessible.ToString()
+                };
+
+                var cmd = new Command("telemetry", "publish")
+                {
+                    Data = JsonConvert.SerializeObject(telemetryData)
+                };
+                cmd.Properties["area"] = "PipelinesTasks";
+                cmd.Properties["feature"] = "CDNConnectivityCheck";
+
+                PublishTelemetry(context, telemetryData, "AgentCDNAccessStatus");
+            }
+            catch (Exception ex)
+            {
+                Trace.Verbose($"Ignoring exception during 'AgentCDNAccessStatus' telemetry publish: '{ex.Message}'");
+            }
+        }
+        
         private void PublishSecretMaskerTelemetryIfOptedIn(IExecutionContext jobContext)
         {
             if (AgentKnobs.SendSecretMaskerTelemetry.GetValue(jobContext).AsBoolean())
